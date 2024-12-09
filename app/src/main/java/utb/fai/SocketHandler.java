@@ -2,6 +2,8 @@ package utb.fai;
 
 import java.io.*;
 import java.net.*;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.*;
 
 public class SocketHandler {
@@ -10,108 +12,160 @@ public class SocketHandler {
 
 	/** client ID je øetìzec ve formátu <IP_adresa>:<port> */
 	String clientID;
+	private String name;
+	private Set<String> chatRooms = new HashSet<>();
 
 	/**
-	 * activeHandlers je reference na mnoinu vech právì bìících SocketHandlerù.
-	 * Potøebujeme si ji udrovat, abychom mohli zprávu od tohoto klienta
-	 * poslat vem ostatním!
+	 * activeHandlers je reference na mnoinu všech právě běžících SocketHandlerů
 	 */
 	ActiveHandlers activeHandlers;
 
-	/**
-	 * messages je fronta pøíchozích zpráv, kterou musí mít kaý klient svoji
-	 * vlastní - pokud bude je pøetíená nebo nefunkèní klientova sí,
-	 * èekají zprávy na doruèení právì ve frontì messages
-	 */
-	ArrayBlockingQueue<String> messages = new ArrayBlockingQueue<String>(20);
+	/** messages je fronta příchozích zpráv */
+	ArrayBlockingQueue<String> messages = new ArrayBlockingQueue<>(20);
 
-	/**
-	 * startSignal je synchronizaèní závora, která zaøizuje, aby oba tasky
-	 * OutputHandler.run() a InputHandler.run() zaèaly ve stejný okamik.
-	 */
+	/** startSignal je synchronizační závora */
 	CountDownLatch startSignal = new CountDownLatch(2);
 
 	/** outputHandler.run() se bude starat o OutputStream mého socketu */
 	OutputHandler outputHandler = new OutputHandler();
+
 	/** inputHandler.run() se bude starat o InputStream mého socketu */
 	InputHandler inputHandler = new InputHandler();
-	/**
-	 * protoe v outputHandleru nedovedu detekovat uzavøení socketu, pomùe mi
-	 * inputFinished
-	 */
+
+	/** inputFinished indicates if input has ended */
 	volatile boolean inputFinished = false;
 
 	public SocketHandler(Socket mySocket, ActiveHandlers activeHandlers) {
-		this.mySocket = mySocket;
-		clientID = mySocket.getInetAddress().toString() + ":" + mySocket.getPort();
-		this.activeHandlers = activeHandlers;
+        this.mySocket = mySocket;
+        clientID = mySocket.getInetAddress().toString() + ":" + mySocket.getPort();
+        this.activeHandlers = activeHandlers;
+    
+        synchronized (activeHandlers) {
+            activeHandlers.add(this);
+        }
+    }
+
+	public String getName() {
+		return name;
+	}
+
+	public Set<String> getChatRooms() {
+		return chatRooms;
+	}
+
+	public void handleCommand(String command) {
+		try {
+			String[] parts = command.split(" ", 3);
+			String mainCommand = parts[0].substring(1); // Remove the '#' prefix
+			String subCommand, message;
+
+			switch (mainCommand) {
+				case "setMyName":
+					if (parts.length < 2) {
+						break;
+					}
+					subCommand = parts[1];
+					// subCommand = "NoveJmeno1";
+					synchronized (activeHandlers) {
+						if (activeHandlers.isNameAvailable(subCommand)) {
+							// Remove from activeHandlersSet with the old name
+							activeHandlers.remove(this);
+							this.name = subCommand;
+							// Re-add to activeHandlersSet with the new name
+							activeHandlers.add(this);
+						} else {
+							messages.offer("The name " + subCommand + " is already in use.\r\n");
+						}
+					}
+					break;
+
+				case "sendPrivate":
+					if (parts.length < 3) {
+						break;
+					}
+					subCommand = parts[1];
+					message = parts[2];
+					activeHandlers.sendPrivateMessage(this, subCommand, message);
+					break;
+
+				case "join":
+					if (parts.length < 2) {
+						break;
+					}
+					subCommand = parts[1];
+					activeHandlers.addToRoom(subCommand, this);
+					break;
+
+				case "leave":
+					if (parts.length < 2) {
+						break;
+					}
+					subCommand = parts[1];
+					if (activeHandlers.removeFromRoom(subCommand, this)) {
+					}
+					break;
+
+				case "groups":
+					Set<String> rooms = activeHandlers.getRoomsForClient(this);
+					if (rooms.isEmpty()) {
+						break;
+					} else {
+						messages.offer(String.join(", ", rooms));
+					}
+					break;
+
+			}
+		} catch (Exception e) {
+			messages.offer("Error processing command: " + e.getMessage() + "\r\n");
+		}
 	}
 
 	class OutputHandler implements Runnable {
 		public void run() {
-			OutputStreamWriter writer;
-			try {
-				System.err.println("DBG>Output handler starting for " + clientID);
+			try (OutputStreamWriter writer = new OutputStreamWriter(mySocket.getOutputStream(), "UTF-8")) {
 				startSignal.countDown();
 				startSignal.await();
-				System.err.println("DBG>Output handler running for " + clientID);
-				writer = new OutputStreamWriter(mySocket.getOutputStream(), "UTF-8");
-				writer.write("\nYou are connected from " + clientID + "\n");
 				writer.flush();
 				while (!inputFinished) {
-					String m = messages.take();// blokující ètení - pokud není ve frontì zpráv nic, uspi se!
-					writer.write(m + "\r\n"); // pokud nìjaké zprávy od ostatních máme,
-					writer.flush(); // poleme je naemu klientovi
-					System.err.println("DBG>Message sent to " + clientID + ":" + m + "\n");
+					String message = messages.take();
+					writer.write(message + "\r\n");
+					writer.flush();
 				}
-			} catch (IOException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			} catch (InterruptedException e) {
-				// TODO Auto-generated catch block
+			} catch (IOException | InterruptedException e) {
 				e.printStackTrace();
 			}
-			System.err.println("DBG>Output handler for " + clientID + " has finished.");
-
 		}
 	}
 
 	class InputHandler implements Runnable {
 		public void run() {
-			try {
-				System.err.println("DBG>Input handler starting for " + clientID);
+			try (BufferedReader reader = new BufferedReader(
+					new InputStreamReader(mySocket.getInputStream(), "UTF-8"))) {
 				startSignal.countDown();
 				startSignal.await();
-				System.err.println("DBG>Input handler running for " + clientID);
-				String request = "";
-				/**
-				 * v okamiku, kdy nás Thread pool spustí, pøidáme se do mnoiny
-				 * vech aktivních handlerù, aby chodily zprávy od ostatních i nám
-				 */
-				activeHandlers.add(SocketHandler.this);
-				BufferedReader reader = new BufferedReader(new InputStreamReader(mySocket.getInputStream(), "UTF-8"));
-				while ((request = reader.readLine()) != null) { // pøila od mého klienta nìjaká zpráva?
-					// ano - poli ji vem ostatním klientùm
-					request = "From client " + clientID + ": " + request;
-					System.out.println(request);
-					activeHandlers.sendMessageToAll(SocketHandler.this, request);
+				String initialName = reader.readLine();
+				handleCommand("#setMyName " + initialName);
+
+				activeHandlers.addToRoom("public", SocketHandler.this);
+
+				String request;
+				while ((request = reader.readLine()) != null) {
+					if (request.startsWith("#")) {
+						handleCommand(request);
+					} else {
+						for (String room : chatRooms) {
+							activeHandlers.broadcastToRoom(SocketHandler.this, room, "[" + name + "] >> " + request);
+						}
+					}
 				}
 				inputFinished = true;
-				messages.offer("OutputHandler, wakeup and die!");
-			} catch (UnknownHostException e) {
-				e.printStackTrace();
-			} catch (IOException e) {
-				e.printStackTrace();
-			} catch (InterruptedException e) {
+			} catch (IOException | InterruptedException e) {
 				e.printStackTrace();
 			} finally {
-				// remove yourself from the set of activeHandlers
 				synchronized (activeHandlers) {
 					activeHandlers.remove(SocketHandler.this);
 				}
 			}
-			System.err.println("DBG>Input handler for " + clientID + " has finished.");
 		}
-
 	}
 }
